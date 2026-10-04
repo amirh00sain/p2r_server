@@ -25,11 +25,6 @@ RUN apk add --no-cache ca-certificates tzdata \
  && chown -R spider:spider /data
 
 COPY --from=build /out/spider-server /usr/local/bin/spider-server
-
-# DATA_DIR must be writable by the unprivileged runtime user; mount a
-# Railway volume at /data to keep generated tokens across deploys.
-VOLUME ["/data"]
-
 USER spider
 ENV PORT=8080 \
     DATA_DIR=/data
