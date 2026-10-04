@@ -12,10 +12,10 @@ FROM golang:1.22-alpine AS build
 WORKDIR /src
 
 # Cache module downloads separately from source changes.
-COPY server/go.mod server/go.sum ./
+COPY go.mod go.sum ./
 RUN go mod download
 
-COPY server/*.go ./
+COPY *.go ./
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/spider-server .
 
 FROM alpine:3.20
