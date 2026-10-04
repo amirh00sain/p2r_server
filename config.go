@@ -37,11 +37,12 @@ type Config struct {
 	AllowedOrigins []string
 
 	// Timeouts.
-	HandshakeTimeout time.Duration
-	DialTimeout      time.Duration
-	WriteTimeout     time.Duration
-	IdleTimeout      time.Duration
-	ShutdownTimeout  time.Duration
+	HandshakeTimeout  time.Duration
+	HeartbeatInterval time.Duration
+	DialTimeout       time.Duration
+	WriteTimeout      time.Duration
+	IdleTimeout       time.Duration
+	ShutdownTimeout   time.Duration
 
 	// Limits.
 	MaxClients           int
@@ -66,11 +67,12 @@ func LoadConfig() (*Config, error) {
 		TrustedProxy:   envBool("TRUST_PROXY", false),
 		AllowedOrigins: envList("ALLOWED_ORIGINS", nil),
 
-		HandshakeTimeout: envDur("HANDSHAKE_TIMEOUT", 15*time.Second),
-		DialTimeout:      envDur("DIAL_TIMEOUT", 15*time.Second),
-		WriteTimeout:     envDur("WRITE_TIMEOUT", 30*time.Second),
-		IdleTimeout:      envDur("IDLE_TIMEOUT", 0), // 0 disables read deadlines
-		ShutdownTimeout:  envDur("SHUTDOWN_TIMEOUT", 15*time.Second),
+		HandshakeTimeout:  envDur("HANDSHAKE_TIMEOUT", 15*time.Second),
+		HeartbeatInterval: envDur("HEARTBEAT_INTERVAL", 20*time.Second),
+		DialTimeout:       envDur("DIAL_TIMEOUT", 15*time.Second),
+		WriteTimeout:      envDur("WRITE_TIMEOUT", 30*time.Second),
+		IdleTimeout:       envDur("IDLE_TIMEOUT", 0), // 0 disables read deadlines
+		ShutdownTimeout:   envDur("SHUTDOWN_TIMEOUT", 15*time.Second),
 
 		MaxClients:           envInt("MAX_CLIENTS", 128),
 		MaxSessionsPerClient: envInt("MAX_SESSIONS_PER_CLIENT", 512),
@@ -100,8 +102,8 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("MAX_SESSIONS_PER_CLIENT must be >= 1, got %d", c.MaxSessionsPerClient)
 	case c.MaxUDPPacketSize < 576, c.MaxUDPPacketSize > 65507:
 		return nil, fmt.Errorf("MAX_UDP_PACKET must be between 576 and 65507, got %d", c.MaxUDPPacketSize)
-	case c.HandshakeTimeout <= 0, c.DialTimeout <= 0, c.WriteTimeout <= 0, c.ShutdownTimeout <= 0:
-		return nil, errors.New("HANDSHAKE_TIMEOUT, DIAL_TIMEOUT, WRITE_TIMEOUT and SHUTDOWN_TIMEOUT must be positive")
+	case c.HandshakeTimeout <= 0, c.HeartbeatInterval <= 0, c.DialTimeout <= 0, c.WriteTimeout <= 0, c.ShutdownTimeout <= 0:
+		return nil, errors.New("HANDSHAKE_TIMEOUT, HEARTBEAT_INTERVAL, DIAL_TIMEOUT, WRITE_TIMEOUT and SHUTDOWN_TIMEOUT must be positive")
 	case c.IdleTimeout < 0:
 		return nil, fmt.Errorf("IDLE_TIMEOUT must be >= 0 (0 disables), got %s", c.IdleTimeout)
 	}

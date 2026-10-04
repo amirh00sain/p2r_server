@@ -62,11 +62,11 @@ func main() {
 	mux.HandleFunc("/api/token", srv.panelAuth(srv.serveToken))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]any{
-			"status":    "ok",
-			"version":   cfg.Version,
-			"clients":   srv.ActiveClients(),
-			"sessions":  srv.ActiveSessions(),
-			"uptime_s":  int64(time.Since(startTime).Seconds()),
+			"status":   "ok",
+			"version":  cfg.Version,
+			"clients":  srv.ActiveClients(),
+			"sessions": srv.ActiveSessions(),
+			"uptime_s": int64(time.Since(startTime).Seconds()),
 		})
 	})
 

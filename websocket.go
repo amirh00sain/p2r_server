@@ -94,6 +94,19 @@ func (c *ClientConn) SendClose(sessionID uint32) {
 	_ = c.SendFrame(MsgClose, sessionID, nil)
 }
 
+// SendWSPing sends a WebSocket control ping. Control pings are separate from
+// the binary protocol heartbeat and are useful for keeping intermediary proxies
+// alive even when there is no tunnel traffic.
+func (c *ClientConn) SendWSPing() error {
+	if c.IsClosed() {
+		return fmt.Errorf("client %s is closed", c.remote)
+	}
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	_ = c.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	return c.conn.WriteControl(websocket.PingMessage, []byte("hb"), time.Now().Add(5*time.Second))
+}
+
 // handleFrame dispatches one decoded client frame.
 func (c *ClientConn) handleFrame(f *Frame) {
 	switch f.Type {
@@ -236,12 +249,12 @@ func (s *Server) ActiveSessions() int {
 
 // ClientsSnapshot copies a stable view of connected clients for the panel.
 type ClientSnapshot struct {
-	Name       string  `json:"name"`
-	User       string  `json:"user"`
-	Sessions   int     `json:"sessions"`
-	RxBytes    uint64  `json:"rx_bytes"`
-	TxBytes    uint64  `json:"tx_bytes"`
-	Connected  float64 `json:"connected_seconds"`
+	Name      string  `json:"name"`
+	User      string  `json:"user"`
+	Sessions  int     `json:"sessions"`
+	RxBytes   uint64  `json:"rx_bytes"`
+	TxBytes   uint64  `json:"tx_bytes"`
+	Connected float64 `json:"connected_seconds"`
 }
 
 func (s *Server) clientsSnapshot() []ClientSnapshot {
@@ -336,9 +349,22 @@ func (s *Server) serveClient(c *ClientConn) {
 	lastPong := time.Now()
 	var mu sync.Mutex // guards lastPong across read/heartbeat goroutines
 
+	// A WebSocket control PONG is handled internally by gorilla/websocket and
+	// does not surface as a normal ReadMessage. Track it explicitly so it also
+	// keeps the server-side heartbeat/deadline alive.
+	c.conn.SetPongHandler(func(string) error {
+		mu.Lock()
+		lastPong = time.Now()
+		mu.Unlock()
+		if s.cfg.IdleTimeout > 0 {
+			_ = c.conn.SetReadDeadline(time.Now().Add(s.cfg.IdleTimeout))
+		}
+		return nil
+	})
+
 	// Heartbeat: server-side PING so a dead client (or a dead middlebox) is
 	// detected even when the client itself went silent.
-	pinger := time.NewTicker(s.cfg.HandshakeTimeoutOrDefault())
+	pinger := time.NewTicker(s.cfg.HeartbeatInterval)
 	defer pinger.Stop()
 	go func() {
 		for {
@@ -352,6 +378,9 @@ func (s *Server) serveClient(c *ClientConn) {
 				if silent > s.cfg.IdleTimeoutOrDefault() && s.cfg.IdleTimeout > 0 {
 					s.log.Debugf("[%s] heartbeat timeout after %s", c.Name(), silent.Round(time.Second))
 					c.Close()
+					return
+				}
+				if err := c.SendWSPing(); err != nil {
 					return
 				}
 				if err := c.SendFrame(MsgPing, 0, []byte("hb")); err != nil {

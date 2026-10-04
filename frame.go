@@ -15,9 +15,9 @@ import (
 //	[6:10]   length    uint32 BE (payload byte count)
 //	[10:10+n] payload
 const (
-	ProtocolVersion byte   = 1
-	HeaderSize      int    = 10
-	MaxPayloadSize  int    = 1 << 20 // hard cap: 1 MiB per frame
+	ProtocolVersion byte = 1
+	HeaderSize      int  = 10
+	MaxPayloadSize  int  = 1 << 20 // hard cap: 1 MiB per frame
 )
 
 // Frame types.

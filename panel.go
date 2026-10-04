@@ -9,19 +9,19 @@ import (
 
 // panelJSON is served at /api/stats for the dashboard's poller.
 type panelJSON struct {
-	Status          string          `json:"status"`
-	Token           string          `json:"token"`
-	Clients         int             `json:"clients"`
-	Sessions        int             `json:"sessions"`
-	RxBytes         uint64          `json:"rx_bytes"`
-	TxBytes         uint64          `json:"tx_bytes"`
-	Version         string          `json:"version"`
-	UptimeSeconds   int64           `json:"uptime_seconds"`
-	ClientsList     []ClientSnapshot `json:"clients_list"`
-	SessionsList    []SessionInfo   `json:"sessions_list"`
-	Logs            []LogEntry      `json:"logs"`
-	TokenPath       string          `json:"token_path"`
-	RailwayPort     string          `json:"port"`
+	Status        string           `json:"status"`
+	Token         string           `json:"token"`
+	Clients       int              `json:"clients"`
+	Sessions      int              `json:"sessions"`
+	RxBytes       uint64           `json:"rx_bytes"`
+	TxBytes       uint64           `json:"tx_bytes"`
+	Version       string           `json:"version"`
+	UptimeSeconds int64            `json:"uptime_seconds"`
+	ClientsList   []ClientSnapshot `json:"clients_list"`
+	SessionsList  []SessionInfo    `json:"sessions_list"`
+	Logs          []LogEntry       `json:"logs"`
+	TokenPath     string           `json:"token_path"`
+	RailwayPort   string           `json:"port"`
 }
 
 func (s *Server) snapshot() panelJSON {

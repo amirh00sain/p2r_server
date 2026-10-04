@@ -63,13 +63,13 @@ func newSession(id uint32, target string, owner *ClientConn) *Session {
 	return s
 }
 
-func (s *Session) setState(st SessionState)   { s.state.Store(int32(st)) }
-func (s *Session) State() SessionState        { return SessionState(s.state.Load()) }
-func (s *Session) IsClosed() bool             { return s.State() == SessionClosed }
-func (s *Session) Done() <-chan struct{}      { return s.closed }
-func (s *Session) AddUp(n int)                { s.bytesUp.Add(uint64(n)) }
-func (s *Session) AddDown(n int)              { s.bytesDown.Add(uint64(n)) }
-func (s *Session) IsUDP() bool                { return s.udp != nil }
+func (s *Session) setState(st SessionState) { s.state.Store(int32(st)) }
+func (s *Session) State() SessionState      { return SessionState(s.state.Load()) }
+func (s *Session) IsClosed() bool           { return s.State() == SessionClosed }
+func (s *Session) Done() <-chan struct{}    { return s.closed }
+func (s *Session) AddUp(n int)              { s.bytesUp.Add(uint64(n)) }
+func (s *Session) AddDown(n int)            { s.bytesDown.Add(uint64(n)) }
+func (s *Session) IsUDP() bool              { return s.udp != nil }
 
 // NotifyClose reports the teardown to the client exactly once.
 func (s *Session) NotifyClose() bool {
