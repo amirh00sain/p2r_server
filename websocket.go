@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/ecdh"
 	"fmt"
 	"net"
 	"net/http"
@@ -19,7 +20,7 @@ var upgrader = websocket.Upgrader{
 	WriteBufferSize:  4096,
 	HandshakeTimeout: 15 * time.Second,
 	CheckOrigin:      func(r *http.Request) bool { return true },
-	Subprotocols:     []string{"spider-wss-v1"},
+	Subprotocols:     []string{"spider-secure-v2"},
 }
 
 // ClientConn is one authenticated tunnel connection.
@@ -32,6 +33,7 @@ type ClientConn struct {
 
 	writeMu sync.Mutex
 	conn    *websocket.Conn
+	sec     *secureState
 
 	closeOnce sync.Once
 	closing   chan struct{}
@@ -39,7 +41,7 @@ type ClientConn struct {
 }
 
 // NewClientConn binds an upgraded socket to a user credential.
-func NewClientConn(conn *websocket.Conn, remote string, user *User, log *Logger, srv *Server) *ClientConn {
+func NewClientConn(conn *websocket.Conn, remote string, user *User, log *Logger, srv *Server, sec *secureState) *ClientConn {
 	c := &ClientConn{
 		remote:   remote,
 		user:     user,
@@ -47,9 +49,10 @@ func NewClientConn(conn *websocket.Conn, remote string, user *User, log *Logger,
 		log:      log,
 		srv:      srv,
 		conn:     conn,
+		sec:      sec,
 		closing:  make(chan struct{}),
 	}
-	conn.SetReadLimit(int64(HeaderSize + MaxPayloadSize))
+	conn.SetReadLimit(int64(secureMaxRecord))
 	return c
 }
 
@@ -78,9 +81,14 @@ func (c *ClientConn) SendFrame(typ byte, sessionID uint32, payload []byte) error
 	if c.IsClosed() {
 		return fmt.Errorf("client %s is closed", c.remote)
 	}
-	buf := EncodeFrame(typ, sessionID, payload)
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	plain := EncodeFrame(typ, sessionID, payload)
+	buf, err := c.sec.seal(plain)
+	if err != nil {
+		c.Close()
+		return err
+	}
 	_ = c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	if err := c.conn.WriteMessage(websocket.BinaryMessage, buf); err != nil {
 		c.Close()
@@ -104,7 +112,7 @@ func (c *ClientConn) SendWSPing() error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	_ = c.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	return c.conn.WriteControl(websocket.PingMessage, []byte("hb"), time.Now().Add(5*time.Second))
+	return c.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(5*time.Second))
 }
 
 // handleFrame dispatches one decoded client frame.
@@ -187,11 +195,12 @@ func (c *ClientConn) limitOK() bool {
 
 // Server orchestrates the HTTP listener, WSS upgrades and shared counters.
 type Server struct {
-	cfg   *Config
-	log   *Logger
-	auth  *Auth
-	users *UserStore
-	stats ServerStats
+	cfg       *Config
+	log       *Logger
+	auth      *Auth
+	users     *UserStore
+	staticKey *ecdh.PrivateKey
+	stats     ServerStats
 
 	clientsMu sync.RWMutex
 	clients   map[*ClientConn]struct{}
@@ -200,13 +209,14 @@ type Server struct {
 }
 
 // NewServer wires a fully configured server.
-func NewServer(cfg *Config, log *Logger, users *UserStore) *Server {
+func NewServer(cfg *Config, log *Logger, users *UserStore, staticKey *ecdh.PrivateKey) *Server {
 	return &Server{
-		cfg:     cfg,
-		log:     log,
-		auth:    NewAuth(users, cfg.PanelPassword),
-		users:   users,
-		clients: make(map[*ClientConn]struct{}),
+		cfg:       cfg,
+		log:       log,
+		auth:      NewAuth(users, cfg.PanelPassword),
+		users:     users,
+		staticKey: staticKey,
+		clients:   make(map[*ClientConn]struct{}),
 	}
 }
 
@@ -285,15 +295,8 @@ func (s *Server) clientsSnapshot() []ClientSnapshot {
 	return out
 }
 
-// handleWS authenticates and upgrades a tunnel client.
+// handleWS upgrades first; SPIDER-SEC-1 authenticates the tunnel inside the WebSocket, so the token is not sent in HTTP headers or the URL.
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
-	user, err := s.auth.Authorize(r)
-	if err != nil {
-		s.log.Warnf("ws handshake from %s rejected: %v", ClientIP(r, s.cfg.TrustedProxy), err)
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
-
 	if origin := r.Header.Get("Origin"); origin != "" && len(s.cfg.AllowedOrigins) > 0 {
 		allowed := false
 		for _, o := range s.cfg.AllowedOrigins {
@@ -328,9 +331,16 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	client := NewClientConn(conn, remote, user, s.log, s)
+	sec, user, err := serverSecureHandshake(conn, s.users, s.staticKey, s.cfg.HandshakeTimeoutOrDefault())
+	if err != nil {
+		_ = conn.Close()
+		s.log.Warnf("secure handshake from %s failed: %v", remote, err)
+		return
+	}
+
+	client := NewClientConn(conn, remote, user, s.log, s, sec)
 	s.addClient(client)
-	s.log.Infof("client connected: %s (token=%s…)", client.Name(), mask(user.Token))
+	s.log.Infof("client connected: %s (token=%s…, secure=%s)", client.Name(), mask(user.Token), secureProtocolName)
 	go s.serveClient(client)
 }
 
@@ -375,7 +385,7 @@ func (s *Server) serveClient(c *ClientConn) {
 				mu.Lock()
 				silent := time.Since(lastPong)
 				mu.Unlock()
-				if silent > s.cfg.IdleTimeoutOrDefault() && s.cfg.IdleTimeout > 0 {
+				if silent > 3*s.cfg.HeartbeatInterval {
 					s.log.Debugf("[%s] heartbeat timeout after %s", c.Name(), silent.Round(time.Second))
 					c.Close()
 					return
@@ -404,7 +414,12 @@ func (s *Server) serveClient(c *ClientConn) {
 		if msgType != websocket.BinaryMessage {
 			continue
 		}
-		frame, err := DecodeFrame(data)
+		plain, err := c.sec.open(data)
+		if err != nil {
+			s.log.Warnf("[%s] dropped unauthenticated secure record: %v", c.Name(), err)
+			return
+		}
+		frame, err := DecodeFrame(plain)
 		if err != nil {
 			s.log.Warnf("[%s] dropped malformed frame: %v", c.Name(), err)
 			continue

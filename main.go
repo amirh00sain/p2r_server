@@ -38,22 +38,29 @@ func main() {
 		os.Exit(1)
 	}
 
+	staticKey, err := loadOrCreateServerStaticKey(cfg.DataDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[fatal] secure static key: %v\n", err)
+		os.Exit(1)
+	}
+
 	if *showToken {
 		fmt.Println(users.Primary())
 		return
 	}
 
-	srv := NewServer(cfg, log, users)
+	srv := NewServer(cfg, log, users, staticKey)
 	log.Infof("Spider WSS Tunnel server v%s starting", Version)
 	log.Infof("credential store: %s (%d token(s))", users.Path(), users.Count())
 	log.Infof("generated fresh primary token for this run")
 	log.Infof("primary token: %s", users.Primary())
+	log.Infof("SPIDER-SEC-1 server public key: %s", encodeServerPublicKey(staticKey.PublicKey()))
 	log.Infof("web panel:   http://0.0.0.0:%s/  (HTTP Basic: admin / %s)", cfg.Port, panelAuthSummary(cfg.PanelPassword))
-	log.Infof("tunnel endpoint: ws://0.0.0.0:%s/ws?token=%s", cfg.Port, users.Primary())
+	log.Infof("tunnel endpoint: ws://0.0.0.0:%s/ws  (token stays inside SPIDER-SEC-1)", cfg.Port)
 
 	mux := http.NewServeMux()
-	// /ws authenticates with the tunnel token; the dashboard and its API
-	// require HTTP Basic (admin / PANEL_PASSWORD).
+	// /ws is an unauthenticated HTTP upgrade; SPIDER-SEC-1 authenticates inside the WebSocket.
+	// The dashboard and its API require HTTP Basic (admin / PANEL_PASSWORD).
 	mux.HandleFunc("/ws", srv.handleWS)
 	mux.HandleFunc("/", srv.panelAuth(srv.servePanel))
 	mux.HandleFunc("/api/stats", srv.panelAuth(srv.serveStats))

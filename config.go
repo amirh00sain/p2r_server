@@ -11,7 +11,7 @@ import (
 )
 
 // Version is stamped at build time with -ldflags "-X main.Version=...".
-var Version = "1.0.0"
+var Version = "2.0.0-secure"
 
 // defaultPort is the fixed listen port. PORT overrides it (Railway injects its
 // own port), but an unset PORT always means 8080.

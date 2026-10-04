@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
@@ -112,6 +113,31 @@ func (s *UserStore) Primary() string {
 }
 
 // Validate performs a constant-time lookup of a presented token.
+// FindByTokenHint maps the public, non-secret SHA-256 token hint used by
+// SPIDER-SEC-1 to the corresponding credential. The actual token is never
+// sent in the WebSocket handshake.
+func (s *UserStore) FindByTokenHint(hint []byte) (*User, bool) {
+	if len(hint) != sha256.Size {
+		return nil, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var match *User
+	for _, tok := range s.orders {
+		u := s.users[tok]
+		digest := sha256.Sum256(append([]byte("SPIDER-SEC-1\x00TOKEN-HINT\x00"), []byte(u.Token)...))
+		if subtle.ConstantTimeCompare(digest[:], hint) == 1 {
+			match = u
+		}
+	}
+	if match == nil {
+		return nil, false
+	}
+	match.LastSeen = time.Now().UTC()
+	cp := *match
+	return &cp, true
+}
+
 func (s *UserStore) Validate(token string) (*User, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
