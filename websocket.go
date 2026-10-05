@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/ecdh"
 	"fmt"
 	"net"
@@ -13,14 +14,30 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// upgrader performs the raw WebSocket handshake. Origin is validated below
-// against ALLOWED_ORIGINS when the operator configured a list.
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:   4096,
-	WriteBufferSize:  4096,
-	HandshakeTimeout: 15 * time.Second,
-	CheckOrigin:      func(r *http.Request) bool { return true },
-	Subprotocols:     []string{"spider-secure-v2"},
+// makeUpgrader builds the WebSocket upgrader for this configuration.
+//
+// CheckOrigin is deliberately NOT allow-everything. The tunnel endpoint is
+// unauthenticated at the HTTP layer -- SPIDER-SEC-3 authenticates inside the
+// encrypted application handshake, after the upgrade -- so accepting any
+// Origin hands every web page on the internet a cross-site socket to this
+// server. An attacker still cannot complete the handshake without the token,
+// but they can force the server to run one and fill the client table, which
+// is a denial-of-service vector aimed at the operator from any web page.
+//
+// The tunnel client is a Go program and sends no Origin header, so
+// non-browser traffic always passes. The operator's own panel is same-origin
+// and passes too. ALLOWED_ORIGINS lets an operator allow further hosts.
+//
+// The subprotocol is deliberately generic. "spider-secure-v2" announced the
+// protocol and its version in a negotiation field anyone on the path reads.
+func makeUpgrader(cfg *Config) websocket.Upgrader {
+	return websocket.Upgrader{
+		ReadBufferSize:   4096,
+		WriteBufferSize:  4096,
+		HandshakeTimeout: cfg.HandshakeTimeoutOrDefault(),
+		CheckOrigin:      originChecker(cfg.AllowedOrigins),
+		Subprotocols:     []string{"chat"},
+	}
 }
 
 // ClientConn is one authenticated tunnel connection.
@@ -33,7 +50,7 @@ type ClientConn struct {
 
 	writeMu sync.Mutex
 	conn    *websocket.Conn
-	sec     *secureState
+	sec     *sec3State
 
 	closeOnce sync.Once
 	closing   chan struct{}
@@ -41,7 +58,7 @@ type ClientConn struct {
 }
 
 // NewClientConn binds an upgraded socket to a user credential.
-func NewClientConn(conn *websocket.Conn, remote string, user *User, log *Logger, srv *Server, sec *secureState) *ClientConn {
+func NewClientConn(conn *websocket.Conn, remote string, user *User, log *Logger, srv *Server, sec *sec3State) *ClientConn {
 	c := &ClientConn{
 		remote:   remote,
 		user:     user,
@@ -52,7 +69,7 @@ func NewClientConn(conn *websocket.Conn, remote string, user *User, log *Logger,
 		sec:      sec,
 		closing:  make(chan struct{}),
 	}
-	conn.SetReadLimit(int64(secureMaxRecord))
+	conn.SetReadLimit(int64(sec3MaxRecord))
 	return c
 }
 
@@ -83,8 +100,11 @@ func (c *ClientConn) SendFrame(typ byte, sessionID uint32, payload []byte) error
 	}
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	// The application frame from frame.go is sealed verbatim inside a
+	// SPIDER-SEC-3 record. frame.go is untouched: this layer wraps the relay,
+	// it does not re-encode it.
 	plain := EncodeFrame(typ, sessionID, payload)
-	buf, err := c.sec.seal(plain)
+	buf, err := c.sec.seal(recFrame, plain)
 	if err != nil {
 		c.Close()
 		return err
@@ -95,6 +115,59 @@ func (c *ClientConn) SendFrame(typ byte, sessionID uint32, payload []byte) error
 		return err
 	}
 	return nil
+}
+
+// SendPadding writes one PADDING record. The client decrypts it, sees
+// recPadding and drops it before the frame decoder runs, so padding can
+// never reorder or corrupt relayed application data.
+func (c *ClientConn) SendPadding(payload []byte) error {
+	if c.IsClosed() {
+		return fmt.Errorf("client %s is closed", c.remote)
+	}
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	buf, err := c.sec.seal(recPadding, payload)
+	if err != nil {
+		c.Close()
+		return err
+	}
+	_ = c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	if err := c.conn.WriteMessage(websocket.BinaryMessage, buf); err != nil {
+		c.Close()
+		return err
+	}
+	return nil
+}
+
+// StartPadding begins the traffic-shaping pump for this connection.
+//
+// It is a no-op when padding is disabled, which is the shipped default. The
+// pump is genuinely not started rather than started and told to hold, so a
+// disabled policy sends nothing at all and leaves behind no background
+// goroutine an operator might mistake for active shaping.
+//
+// Shaping is per direction: this side sends, the client authenticates each
+// record and discards it before the frame decoder runs (and the mirror image
+// when the client enables it), so enabling it on one leg shapes that leg's
+// observable traffic without touching application data either way.
+//
+// The pump stops on Done(), so a dropped client cannot leave a goroutine
+// sealing records into a dead socket.
+func (c *ClientConn) StartPadding(cfg *PaddingConfig) {
+	if cfg == nil || !cfg.Enabled {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		<-c.Done()
+		cancel()
+	}()
+	go runPadding(ctx, cfg, c.SendPadding, func(size int) {
+		if c.srv != nil {
+			c.srv.paddingTX.Add(1)
+		}
+		c.log.Debugf("[%s] padding sent (%d bytes)", c.Name(), size)
+	})
 }
 
 // SendClose notifies the client that a session must be torn down locally.
@@ -206,17 +279,32 @@ type Server struct {
 	clients   map[*ClientConn]struct{}
 
 	clientsTotal atomic.Int32
+
+	// handshakeLimiter bounds unauthenticated handshake attempts per source
+	// IP. See secure_handshake.go for why the trial-decryption loop needs it.
+	handshakeLimiter *handshakeLimiter
+
+	// upgrader is built once from config. CheckOrigin is configuration
+	// dependent, so it cannot live in a package-level value.
+	upgrader websocket.Upgrader
+
+	// paddingRX/TX count PADDING records, separately from application
+	// traffic, so the panel can report shaping without inflating relay stats.
+	paddingRX atomic.Uint64
+	paddingTX atomic.Uint64
 }
 
 // NewServer wires a fully configured server.
 func NewServer(cfg *Config, log *Logger, users *UserStore, staticKey *ecdh.PrivateKey) *Server {
 	return &Server{
-		cfg:       cfg,
-		log:       log,
-		auth:      NewAuth(users, cfg.PanelPassword),
-		users:     users,
-		staticKey: staticKey,
-		clients:   make(map[*ClientConn]struct{}),
+		cfg:              cfg,
+		log:              log,
+		auth:             NewAuth(users, cfg.PanelPassword),
+		users:            users,
+		staticKey:        staticKey,
+		clients:          make(map[*ClientConn]struct{}),
+		handshakeLimiter: newHandshakeLimiter(cfg.HandshakeRateLimit),
+		upgrader:         makeUpgrader(cfg),
 	}
 }
 
@@ -295,7 +383,8 @@ func (s *Server) clientsSnapshot() []ClientSnapshot {
 	return out
 }
 
-// handleWS upgrades first; SPIDER-SEC-1 authenticates the tunnel inside the WebSocket, so the token is not sent in HTTP headers or the URL.
+// handleWS upgrades first; SPIDER-SEC-3 authenticates the tunnel inside the
+// WebSocket, so the token never appears in HTTP headers or the URL.
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	if origin := r.Header.Get("Origin"); origin != "" && len(s.cfg.AllowedOrigins) > 0 {
 		allowed := false
@@ -325,13 +414,42 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	conn, err := upgrader.Upgrade(w, r, nil)
+	// Rate-limit before the upgrade so a flood of handshakes costs a map
+	// lookup rather than an X25519 exchange and a credential-store walk.
+	if !s.handshakeLimiter.allow(remote) {
+		s.log.Warnf("ws handshake from %s rate limited (HANDSHAKE_RATE_LIMIT=%d/min)", remote, s.cfg.HandshakeRateLimit)
+		http.Error(w, "too many handshake attempts", http.StatusTooManyRequests)
+		return
+	}
+
+	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		s.log.Debugf("ws upgrade from %s failed: %v", remote, err)
 		return
 	}
 
-	sec, user, err := serverSecureHandshake(conn, s.users, s.staticKey, s.cfg.HandshakeTimeoutOrDefault())
+	aeadID, err := aeadIDFromName(s.cfg.AEAD)
+	if err != nil {
+		_ = conn.Close()
+		s.log.Errorf("config: %v", err)
+		return
+	}
+	var accepted []uint8
+	if s.cfg.AEAD != "" {
+		accepted = []uint8{aeadID}
+	}
+
+	sec, user, err := serverSecureHandshake(&wsTransport{conn: conn}, serverHandshakeParams{
+		Users:             s.users,
+		StaticKey:         s.staticKey,
+		AcceptedAEADs:     accepted,
+		SupportedFeatures: []string{"tcp", "https", "udp"},
+		AEAD:              aeadID,
+		RotateBytes:       s.cfg.KeyRotateBytes,
+		RotateSecs:        int64(s.cfg.KeyRotateSeconds.Seconds()),
+		Timeout:           s.cfg.HandshakeTimeoutOrDefault(),
+		Logf:              s.log.Infof,
+	})
 	if err != nil {
 		_ = conn.Close()
 		s.log.Warnf("secure handshake from %s failed: %v", remote, err)
@@ -339,8 +457,12 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	client := NewClientConn(conn, remote, user, s.log, s, sec)
+	// Traffic shaping starts only now that the record layer exists: a padding
+	// record is sealed under a live epoch key, so there is nothing to pump
+	// before the handshake completes.
+	client.StartPadding(&s.cfg.Padding)
 	s.addClient(client)
-	s.log.Infof("client connected: %s (token=%s…, secure=%s)", client.Name(), mask(user.Token), secureProtocolName)
+	s.log.Infof("client connected: %s (secure=%s aead=%s)", client.Name(), Sec3ProtocolName, aeadName(aeadID))
 	go s.serveClient(client)
 }
 
@@ -414,10 +536,16 @@ func (s *Server) serveClient(c *ClientConn) {
 		if msgType != websocket.BinaryMessage {
 			continue
 		}
-		plain, err := c.sec.open(data)
+		recType, plain, err := c.sec.open(data)
 		if err != nil {
 			s.log.Warnf("[%s] dropped unauthenticated secure record: %v", c.Name(), err)
 			return
+		}
+		if recType == recPadding {
+			// Authenticated padding: discard. It must not reach the frame
+			// decoder, the session table or the heartbeat clock.
+			s.paddingRX.Add(1)
+			continue
 		}
 		frame, err := DecodeFrame(plain)
 		if err != nil {

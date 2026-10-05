@@ -54,9 +54,21 @@ func main() {
 	log.Infof("credential store: %s (%d token(s))", users.Path(), users.Count())
 	log.Infof("generated fresh primary token for this run")
 	log.Infof("primary token: %s", users.Primary())
-	log.Infof("SPIDER-SEC-1 server public key: %s", encodeServerPublicKey(staticKey.PublicKey()))
-	log.Infof("web panel:   http://0.0.0.0:%s/  (HTTP Basic: admin / %s)", cfg.Port, panelAuthSummary(cfg.PanelPassword))
-	log.Infof("tunnel endpoint: ws://0.0.0.0:%s/ws  (token stays inside SPIDER-SEC-1)", cfg.Port)
+	log.Infof("%s server public key: %s", Sec3ProtocolName, encodeServerPublicKey(staticKey.PublicKey()))
+	// The panel password is deliberately NOT printed. Startup logs are
+	// readable from the web panel's own /api/logs endpoint and from any
+	// log drain, so echoing the credential there would put it in front of
+	// exactly the people who should not have it.
+	log.Infof("web panel:   http://0.0.0.0:%s/  (HTTP Basic: admin, see PANEL_PASSWORD)", cfg.Port)
+	log.Infof("tunnel endpoint: ws://0.0.0.0:%s/ws  (token stays inside %s)", cfg.Port, Sec3ProtocolName)
+	if len(cfg.AllowedOrigins) == 0 {
+		log.Infof("websocket origin check: same-origin only (set ALLOWED_ORIGINS to allow browser pages on other hosts)")
+	} else {
+		log.Infof("websocket origin check: %v", cfg.AllowedOrigins)
+	}
+	aeadID, _ := aeadIDFromName(cfg.AEAD)
+	log.Infof("aead=%s key_rotate_bytes=%d key_rotate=%s handshake_rate_limit=%d/min padding=%v",
+		aeadName(aeadID), cfg.KeyRotateBytes, cfg.KeyRotateSeconds, cfg.HandshakeRateLimit, cfg.Padding.Enabled)
 
 	mux := http.NewServeMux()
 	// /ws is an unauthenticated HTTP upgrade; SPIDER-SEC-1 authenticates inside the WebSocket.

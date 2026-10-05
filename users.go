@@ -2,7 +2,6 @@ package main
 
 import (
 	"crypto/rand"
-	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
@@ -86,13 +85,34 @@ func NewUserStore(dataDir string) (*UserStore, error) {
 	return s, nil
 }
 
-// GenerateToken returns a 256-bit cryptographically random hex token.
+// GenerateToken returns a 256-bit cryptographically random hex token that is
+// guaranteed to satisfy ValidateToken.
+//
+// The guarantee matters more than it looks. The client runs ValidateToken
+// before it sends a single byte of the handshake, so a credential that fails
+// it is one the client will refuse to use — and a random draw over a
+// 16-symbol hex alphabet has a substantial chance of clustering below the
+// 16-distinct-character floor. An unguarded GenerateToken would therefore
+// issue primary tokens that a legitimate client rejects outright, with the
+// operator seeing only "token rejected" and no hint as to why. Retrying here
+// keeps the entropy floor strict while making it impossible to issue a
+// credential the client cannot use.
+//
+// The loop is bounded because an unbounded retry on a broken entropy source
+// would hang startup instead of failing loudly.
 func GenerateToken() (string, error) {
-	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
+	for attempt := 0; attempt < 64; attempt++ {
+		b := make([]byte, 32)
+		if _, err := rand.Read(b); err != nil {
+			return "", err
+		}
+		tok := hex.EncodeToString(b)
+		if _, err := ValidateToken(tok); err != nil {
+			continue
+		}
+		return tok, nil
 	}
-	return hex.EncodeToString(b), nil
+	return "", fmt.Errorf("could not generate a token satisfying ValidateToken after 64 attempts")
 }
 
 // PrimaryLocked returns the primary token. Caller must hold at least a read lock.
@@ -112,32 +132,29 @@ func (s *UserStore) Primary() string {
 	return s.PrimaryLocked()
 }
 
-// Validate performs a constant-time lookup of a presented token.
-// FindByTokenHint maps the public, non-secret SHA-256 token hint used by
-// SPIDER-SEC-1 to the corresponding credential. The actual token is never
-// sent in the WebSocket handshake.
-func (s *UserStore) FindByTokenHint(hint []byte) (*User, bool) {
-	if len(hint) != sha256.Size {
-		return nil, false
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	var match *User
+// Candidates returns a snapshot of every stored credential, in the order the
+// handshake will try them.
+//
+// There is deliberately no lookup-by-hint. SPIDER-SEC-3 identifies the
+// caller by trial-decrypting INNER_HELLO against every candidate (see
+// secure_handshake.go), which keeps the credential off the wire entirely.
+// The slice is ordered so the trial loop is deterministic; it is always
+// walked to completion regardless of whether a match is found early.
+func (s *UserStore) Candidates() []*User {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]*User, 0, len(s.orders))
 	for _, tok := range s.orders {
-		u := s.users[tok]
-		digest := sha256.Sum256(append([]byte("SPIDER-SEC-1\x00TOKEN-HINT\x00"), []byte(u.Token)...))
-		if subtle.ConstantTimeCompare(digest[:], hint) == 1 {
-			match = u
+		if u, ok := s.users[tok]; ok {
+			cp := *u
+			out = append(out, &cp)
 		}
 	}
-	if match == nil {
-		return nil, false
-	}
-	match.LastSeen = time.Now().UTC()
-	cp := *match
-	return &cp, true
+	return out
 }
 
+// Validate performs a constant-time lookup of a presented token. It backs the
+// web panel's explicit "check this token" path, not the tunnel handshake.
 func (s *UserStore) Validate(token string) (*User, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
