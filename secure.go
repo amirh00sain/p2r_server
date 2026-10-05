@@ -24,8 +24,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"sync"
 	"time"
 
@@ -374,14 +372,6 @@ func clientSecureHandshake(conn *websocket.Conn, token string, serverPublicKey s
 
 	c2s, s2c := deriveDataKeys(token, sharedES, sharedEE, sha256Bytes(transcript, sha256Bytes(serverCipher), sha256Bytes(clientFinish)))
 	return newSecureState(c2s, s2c)
-}
-
-func hmacSHA256(key []byte, parts ...[]byte) []byte {
-	mac := hmac.New(sha256.New, key)
-	for _, p := range parts {
-		_, _ = mac.Write(p)
-	}
-	return mac.Sum(nil)
 }
 
 func binaryBigEndianPutUint64(dst []byte, v uint64) {
