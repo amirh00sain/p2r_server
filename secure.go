@@ -167,20 +167,8 @@ func hkdfExpandSHA256(prk, info []byte, length int) []byte {
 	return out
 }
 
-func sha256Bytes(parts ...[]byte) []byte {
-	h := sha256.New()
-	for _, p := range parts {
-		_, _ = h.Write(p)
-	}
-	return h.Sum(nil)
-}
-
 func tokenHint(token string) []byte {
 	return sha256Bytes([]byte("SPIDER-SEC-1\x00TOKEN-HINT\x00"), []byte(token))
-}
-
-func tokenSalt(token string) []byte {
-	return sha256Bytes([]byte("SPIDER-SEC-1\x00TOKEN\x00"), []byte(token))
 }
 
 func deriveHandshakeKeys(token string, sharedES, sharedEE, clientHello, serverHeader []byte) (serverKey, clientKey, transcript []byte) {
@@ -319,35 +307,6 @@ func decodeServerPublicKey(encoded string) (*ecdh.PublicKey, error) {
 	return ecdh.X25519().NewPublicKey(b)
 }
 
-func encodeServerPublicKey(pub *ecdh.PublicKey) string {
-	return base64.RawURLEncoding.EncodeToString(pub.Bytes())
-}
-
-func loadOrCreateServerStaticKey(dataDir string) (*ecdh.PrivateKey, error) {
-	path := filepath.Join(dataDir, "server_static_x25519.key")
-	if b, err := os.ReadFile(path); err == nil {
-		if len(b) != 32 {
-			return nil, fmt.Errorf("%w: %s has %d bytes, want 32", errSecureProtocol, path, len(b))
-		}
-		key, err := ecdh.X25519().NewPrivateKey(b)
-		if err != nil {
-			return nil, fmt.Errorf("%w: invalid server static key: %v", errSecureProtocol, err)
-		}
-		return key, nil
-	} else if !os.IsNotExist(err) {
-		return nil, fmt.Errorf("%w: read %s: %v", errSecureProtocol, path, err)
-	}
-
-	key, err := ecdh.X25519().GenerateKey(rand.Reader)
-	if err != nil {
-		return nil, fmt.Errorf("%w: generate server static key: %v", errSecureProtocol, err)
-	}
-	if err := os.WriteFile(path, key.Bytes(), 0o600); err != nil {
-		return nil, fmt.Errorf("%w: write %s: %v", errSecureProtocol, path, err)
-	}
-	return key, nil
-}
-
 func clientSecureHandshake(conn *websocket.Conn, token string, serverPublicKey string, timeout time.Duration) (*secureState, error) {
 	serverStatic, err := decodeServerPublicKey(serverPublicKey)
 	if err != nil {
@@ -415,84 +374,6 @@ func clientSecureHandshake(conn *websocket.Conn, token string, serverPublicKey s
 
 	c2s, s2c := deriveDataKeys(token, sharedES, sharedEE, sha256Bytes(transcript, sha256Bytes(serverCipher), sha256Bytes(clientFinish)))
 	return newSecureState(c2s, s2c)
-}
-
-func serverSecureHandshake(conn *websocket.Conn, users *UserStore, staticKey *ecdh.PrivateKey, timeout time.Duration) (*secureState, *User, error) {
-	msg, err := readWSBinary(conn, time.Now().Add(timeout))
-	if err != nil {
-		return nil, nil, fmt.Errorf("%w: receive client hello: %v", errSecureProtocol, err)
-	}
-	hint, clientPubBytes, _, err := parseClientHello(msg)
-	if err != nil {
-		return nil, nil, err
-	}
-	user, ok := users.FindByTokenHint(hint)
-	if !ok {
-		return nil, nil, fmt.Errorf("%w: unknown credential hint", errSecureProtocol)
-	}
-	clientPub, err := ecdh.X25519().NewPublicKey(clientPubBytes)
-	if err != nil {
-		return nil, nil, fmt.Errorf("%w: client ephemeral key: %v", errSecureProtocol, err)
-	}
-
-	eph, err := ecdh.X25519().GenerateKey(rand.Reader)
-	if err != nil {
-		return nil, nil, fmt.Errorf("%w: server ephemeral key: %v", errSecureProtocol, err)
-	}
-	serverNonce := make([]byte, 32)
-	if _, err := rand.Read(serverNonce); err != nil {
-		return nil, nil, fmt.Errorf("%w: server nonce: %v", errSecureProtocol, err)
-	}
-	serverHeader := makeServerHeader(eph.PublicKey().Bytes(), serverNonce)
-
-	sharedES, err := staticKey.ECDH(clientPub)
-	if err != nil {
-		return nil, nil, fmt.Errorf("%w: x25519 static auth: %v", errSecureProtocol, err)
-	}
-	sharedEE, err := eph.ECDH(clientPub)
-	if err != nil {
-		return nil, nil, fmt.Errorf("%w: x25519 ephemeral: %v", errSecureProtocol, err)
-	}
-	if bytes.Equal(sharedES, make([]byte, len(sharedES))) || bytes.Equal(sharedEE, make([]byte, len(sharedEE))) {
-		return nil, nil, fmt.Errorf("%w: invalid all-zero x25519 secret", errSecureProtocol)
-	}
-
-	serverKey, clientKey, transcript := deriveHandshakeKeys(user.Token, sharedES, sharedEE, msg, serverHeader)
-	serverProof := hmacSHA256(serverKey, []byte("server-proof"), msg, serverHeader, staticKey.PublicKey().Bytes())
-	serverCipher, err := encryptHandshake(serverKey, 1, serverProof, serverHeader)
-	if err != nil {
-		return nil, nil, fmt.Errorf("%w: server proof encryption: %v", errSecureProtocol, err)
-	}
-	serverHello := append(append([]byte(nil), serverHeader...), serverCipher...)
-
-	_ = conn.SetWriteDeadline(time.Now().Add(timeout))
-	if err := conn.WriteMessage(websocket.BinaryMessage, serverHello); err != nil {
-		return nil, nil, fmt.Errorf("%w: send server hello: %v", errSecureProtocol, err)
-	}
-
-	finish, err := readWSBinary(conn, time.Now().Add(timeout))
-	if err != nil {
-		return nil, nil, fmt.Errorf("%w: receive client finish: %v", errSecureProtocol, err)
-	}
-	clientCipher, err := parseClientFinish(finish)
-	if err != nil {
-		return nil, nil, err
-	}
-	expectedClientProof := hmacSHA256(clientKey, []byte("client-proof"), msg, serverHeader, sha256Bytes(serverCipher))
-	clientProof, err := decryptHandshake(clientKey, 2, clientCipher, msg)
-	if err != nil || !hmac.Equal(clientProof, expectedClientProof) {
-		return nil, nil, fmt.Errorf("%w: client authentication failed", errSecureProtocol)
-	}
-
-	c2s, s2c := deriveDataKeys(user.Token, sharedES, sharedEE, sha256Bytes(transcript, sha256Bytes(serverCipher), sha256Bytes(finish)))
-	_ = conn.SetWriteDeadline(time.Time{})
-	return func() (*secureState, *User, error) {
-		state, err := newSecureState(s2c, c2s)
-		if err != nil {
-			return nil, nil, err
-		}
-		return state, user, nil
-	}()
 }
 
 func hmacSHA256(key []byte, parts ...[]byte) []byte {
